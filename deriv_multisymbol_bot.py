@@ -78,8 +78,8 @@ HEARTBEAT_INTERVAL = 20   # seconds between pings
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 2
-MARTINGALE_MAX_STEPS = 9               # up to 3 recovery steps after the initial stake
+MARTINGALE_FACTOR = 1.24
+MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds (2 hours)
 LOSS_TRIGGER_THRESHOLD = 2                     # consecutive losses on the SAME symbol
@@ -90,7 +90,7 @@ HISTORY_BOOTSTRAP_COUNT = 3000                 # ticks fetched per symbol at sta
 
 CONFIDENCE_THRESHOLD = 0.11            # minimum ensemble score to trade (0-1 scale)
 MIN_SCORE_GAP = 0.03                   # required gap over runner-up symbol
-CANDIDATE_DURATIONS = [1, 3, 5, 10,]  # ticks, Monte Carlo picks the best of these
+CANDIDATE_DURATIONS = [1, 3, 5, 10, 15]  # ticks, Monte Carlo picks the best of these
 MC_SIMULATIONS = 500
 
 MIN_TICKS_FOR_FIT = 200                # minimum ticks before a model can be fitted
@@ -432,7 +432,11 @@ class DerivClient:
 async def fetch_tradable_symbols(client):
     """Builds the symbol universe dynamically: synthetic indices only, 1HZ
     variants excluded, only symbols that actually support CALL/PUT contracts."""
-    resp = await client.send({"active_symbols": "brief", "product_type": "basic"})
+    resp = await client.send({"active_symbols": "brief"})
+    if "error" in resp:
+        print(f"[fetch_tradable_symbols] active_symbols error: {resp['error']}")
+        return []
+
     candidates = []
     for s in resp.get("active_symbols", []):
         symbol = s["symbol"]
@@ -443,16 +447,25 @@ async def fetch_tradable_symbols(client):
         if not s.get("exchange_is_open", 1):
             continue
         candidates.append(symbol)
+    print(f"[fetch_tradable_symbols] {len(candidates)} synthetic-index candidates before contracts_for check")
 
     verified = []
+    cf_errors = []
     for symbol in candidates:
         try:
             cf = await client.send({"contracts_for": symbol, "currency": "USD"})
+            if "error" in cf:
+                cf_errors.append(f"{symbol}: {cf['error']}")
+                continue
             types = {c["contract_type"] for c in cf.get("contracts_for", {}).get("available", [])}
             if "CALL" in types and "PUT" in types:
                 verified.append(symbol)
-        except Exception:
-            continue
+        except Exception as e:
+            cf_errors.append(f"{symbol}: {type(e).__name__}: {e}")
+        await asyncio.sleep(0.05)  # light throttle - avoid bursting dozens of requests at once
+
+    if cf_errors:
+        print(f"[fetch_tradable_symbols] {len(cf_errors)}/{len(candidates)} contracts_for calls failed, e.g.: {cf_errors[:3]}")
     return verified
 
 
@@ -1176,7 +1189,13 @@ async def main():
     state.balance = balance_resp["balance"]["balance"]
     print(f"Starting balance: {state.balance}")
 
-    symbols = await fetch_tradable_symbols(client)
+    symbols = []
+    for attempt in range(1, 6):
+        symbols = await fetch_tradable_symbols(client)
+        if symbols:
+            break
+        print(f"[main] No tradable symbols on attempt {attempt}/5, retrying in 3s...")
+        await asyncio.sleep(3)
     if not symbols:
         raise RuntimeError("No tradable rise/fall symbols found (check API credentials/connectivity).")
     print(f"Tradable universe ({len(symbols)} symbols, 1HZ excluded): {symbols}")
