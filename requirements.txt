@@ -1,4 +1,5 @@
 websockets>=16.0
+requests>=2.31
 numpy>=2.0
 scipy>=1.17
 statsmodels>=0.14
