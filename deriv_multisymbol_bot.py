@@ -47,11 +47,14 @@ ENV VARS REQUIRED:
 """
 
 import asyncio
+import io
 import json
 import os
 import random
+import sys
 import time
 import math
+import contextlib
 import warnings
 import numpy as np
 import requests
@@ -95,10 +98,27 @@ CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration 
 TOP_K_DEEP_DIVE = 5                            # symbols deep-validated per calibration
 HISTORY_BOOTSTRAP_COUNT = 3000                 # ticks fetched per symbol at startup
 
-CONFIDENCE_THRESHOLD = 0.11            # minimum ensemble score to trade (0-1 scale)
+CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only - real threshold is set adaptively by
+                                        # the calibrator from the observed score distribution
+                                        # (see ADAPTIVE_THRESHOLD_PERCENTILE below)
 MIN_SCORE_GAP = 0.03                   # required gap over runner-up symbol
-CANDIDATE_DURATIONS = [1, 3, 5, 10, 15]  # ticks, Monte Carlo picks the best of these
+CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks - Deriv rejects tick contracts outside 1-10,
+                                          # this was the cause of the repeated "Number of ticks
+                                          # must be between 1 and 10" trade errors
 MC_SIMULATIONS = 500
+MIN_EXP_WIN_RATE = 0.45                # Monte Carlo sanity gate: if even the BEST candidate
+                                        # duration's simulated win rate is below this, skip the
+                                        # trade entirely rather than firing on a duration the
+                                        # model itself thinks is a coin-flip-or-worse
+
+ADAPTIVE_THRESHOLD_PERCENTILE = 65     # calibration sets CONFIDENCE_THRESHOLD to this
+                                        # percentile of the actual confidence scores seen during
+                                        # walk-forward replay, so the bar is empirically reachable
+                                        # for the real data instead of a hand-picked guess
+
+WATCHDOG_TIMEOUT = 5 * 60              # seconds of total silence (no tick, no loop iteration)
+                                        # before the bot force-restarts itself in place
+WATCHDOG_CHECK_INTERVAL = 20           # how often the watchdog checks for staleness
 
 MIN_TICKS_FOR_FIT = 200                # minimum ticks before a model can be fitted
 MIN_TICKS_LIVE = 60                    # minimum ticks before live layers (Markov etc.) run
@@ -118,6 +138,8 @@ class TradeState:
         self.last_scheduled_calibration = time.time()
         self.last_calibration_end = 0.0
         self.model_cache: Dict[str, "SymbolModels"] = {}
+        self.adaptive_threshold = CONFIDENCE_THRESHOLD_DEFAULT
+        self.last_activity = time.time()  # updated by ticks and main-loop iterations; watchdog reads this
 
 
 @dataclass
@@ -352,8 +374,10 @@ class DerivClient:
 
 
 async def fetch_tradable_symbols(client):
-    """Builds the symbol universe dynamically: synthetic indices only, 1HZ
-    variants excluded, only symbols that actually support CALL/PUT contracts.
+    """Builds the symbol universe dynamically: R_ volatility indices ONLY
+    (R_10, R_25, R_50, R_75, R_100) - JD/stpRNG/RDBEAR/RDBULL families and all
+    1HZ variants are explicitly excluded, and only symbols that actually
+    support CALL/PUT contracts are kept.
 
     New API: `active_symbols` response field is `underlying_symbol` (renamed
     from `symbol`), and `contracts_for` no longer takes `currency`."""
@@ -367,12 +391,14 @@ async def fetch_tradable_symbols(client):
         symbol = s.get("underlying_symbol")
         if not symbol or "1HZ" in symbol:
             continue
+        if not symbol.startswith("R_"):
+            continue
         if s.get("market") != "synthetic_index":
             continue
         if not s.get("exchange_is_open", 1):
             continue
         candidates.append(symbol)
-    print(f"[fetch_tradable_symbols] {len(candidates)} synthetic-index candidates before contracts_for check")
+    print(f"[fetch_tradable_symbols] {len(candidates)} R_ candidates before contracts_for check")
 
     verified = []
     cf_errors = []
@@ -663,7 +689,15 @@ def fit_garch(returns, scale=1000.0):
     try:
         scaled = returns * scale
         am = arch_model(scaled, vol="Garch", p=1, q=1, mean="Zero", dist="normal")
-        return am.fit(disp="off")
+        # arch's SLSQP optimizer prints convergence diagnostics directly to
+        # stdout/stderr on non-convergence, bypassing warnings.filterwarnings.
+        # These aren't fatal (a result is still returned) but were showing up
+        # as noisy 'error' severity log lines - fully suppress at the source.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                result = am.fit(disp="off")
+        return result
     except Exception as e:
         print(f"[GARCH] fit failed: {e}")
         return None
@@ -875,7 +909,16 @@ def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
     """Takes the direction already decided by the Bayesian layer (does NOT
     re-decide direction) and simulates forward paths - using the GARCH
     conditional volatility and OU mean-reversion pull from the fitted models -
-    to find which duration maximizes expected win probability."""
+    to find which duration maximizes expected win probability.
+
+    IMPORTANT: the OU reversion pull is weighted by (1 - trend_weight), the
+    SAME weighting Bayesian fusion already applied when it decided direction.
+    Applying the full, unweighted reversion pull here (as in the prior
+    version) could silently fight the chosen direction whenever momentum
+    layers had already correctly out-voted reversion - producing simulated
+    win rates near 0 even for the "selected" direction. That mismatch is
+    exactly what caused exp_win=0.00 selections and the duration=15 bias
+    seen in earlier logs."""
     if len(returns) < 20:
         return candidate_durations[0], 0.5
 
@@ -887,10 +930,12 @@ def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
     drift = direction * abs(np.mean(returns[-50:])) * (1 + abs(hawkes_signal) * 0.5) if len(returns) >= 50 else 0.0
 
     ou_params = feats.get("ou_params")
+    trend_weight = feats.get("trend_weight", 0.5)
     current_price = prices[-1]
     reversion_pull = 0.0
     if ou_params and ou_params.get("theta", 0) > 0:
-        reversion_pull = ou_params["theta"] * (ou_params["mu"] - current_price) * 0.01
+        raw_pull = ou_params["theta"] * (ou_params["mu"] - current_price) * 0.01
+        reversion_pull = raw_pull * (1 - trend_weight)
 
     best = None
     for dur in candidate_durations:
@@ -906,7 +951,7 @@ def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
 # ---------------------------------------------------------------------------
 # ENSEMBLE SELECTOR
 # ---------------------------------------------------------------------------
-def select_trade(symbol_scores, reliability):
+def select_trade(symbol_scores, reliability, threshold):
     scored = []
     for symbol, (p_up, confidence) in symbol_scores.items():
         score = confidence * reliability.get(symbol, 1.0)
@@ -916,7 +961,7 @@ def select_trade(symbol_scores, reliability):
         return None
     scored.sort(key=lambda x: x[3], reverse=True)
     top = scored[0]
-    if top[3] < CONFIDENCE_THRESHOLD:
+    if top[3] < threshold:
         return None
     if len(scored) > 1 and (top[3] - scored[1][3]) < MIN_SCORE_GAP:
         return None
@@ -997,27 +1042,31 @@ def walk_forward_validate(sd, train_frac=0.8, horizon=5, step=5):
     buffered ticks only, then step through the held-out remainder tick by tick
     (simulating live arrival), generating predictions from the FROZEN trained
     models and comparing to realized direction `horizon` ticks later. Returns
-    (hit_rate, fitted_models) - the same models get cached for live trading if
-    validation passes a sane bar."""
+    (hit_rate, fitted_models, confidences) - the same models get cached for
+    live trading if validation passes a sane bar, and `confidences` (the raw
+    confidence score at each replayed point) feeds the adaptive threshold
+    calibration in run_calibration."""
     n_ticks = len(sd.ticks)
     if n_ticks < MIN_TICKS_FOR_FIT + 100:
-        return 0.5, None
+        return 0.5, None, []
 
     split = max(MIN_TICKS_FOR_FIT, int(n_ticks * train_frac))
     train_sd = sd.slice_copy(split)
     models = fit_symbol_models(train_sd)
     if not models.fitted:
-        return 0.5, None
+        return 0.5, None, []
 
     eval_sd = sd.slice_copy(split)
     remaining_ticks = list(sd.ticks)[split:]
     hits, total = 0, 0
+    confidences = []
     for i in range(0, len(remaining_ticks) - horizon, step):
         eval_sd.add_tick(*remaining_ticks[i])
         feats = compute_features(eval_sd, models, {sd.symbol: eval_sd.returns()})
         if feats is None:
             continue
-        p_up, _ = bayesian_fusion(feats)
+        p_up, confidence = bayesian_fusion(feats)
+        confidences.append(confidence)
         predicted_dir = 1 if p_up > 0.5 else -1
         current_price = remaining_ticks[i][1]
         future_price = remaining_ticks[i + horizon][1]
@@ -1026,7 +1075,7 @@ def walk_forward_validate(sd, train_frac=0.8, horizon=5, step=5):
         total += 1
 
     hit_rate = hits / total if total > 0 else 0.5
-    return hit_rate, models
+    return hit_rate, models, confidences
 
 
 async def run_calibration(state, symbol_data, symbols, trigger_reason):
@@ -1052,20 +1101,40 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
         if loss_symbol and loss_symbol not in candidates:
             candidates.append(loss_symbol)
 
+    all_confidences = []
     for s in candidates:
         sd = symbol_data[s]
         if len(sd.ticks) < MIN_TICKS_FOR_FIT + 100:
             print(f"[Calibrator] {s}: not enough ticks yet, skipping this cycle.")
             continue
-        hit_rate, models = walk_forward_validate(sd)
+        hit_rate, models, confidences = walk_forward_validate(sd)
         if models is not None:
             state.model_cache[s] = models
         state.reliability[s] = float(np.clip(hit_rate / 0.5, 0.3, 1.5))
         state.consecutive_losses[s] = 0
-        print(f"[Calibrator] {s}: walk-forward hit_rate={hit_rate:.3f} reliability={state.reliability[s]:.2f}")
+        all_confidences.extend(confidences)
+        print(f"[Calibrator] {s}: walk-forward hit_rate={hit_rate:.3f} reliability={state.reliability[s]:.2f} "
+              f"n_confidence_samples={len(confidences)}")
+
+    if all_confidences:
+        new_threshold = float(np.percentile(all_confidences, ADAPTIVE_THRESHOLD_PERCENTILE))
+        # never let the bar collapse to ~0 (untradeable noise floor) or demand
+        # near-impossible confidence - keep it in a sane band regardless of
+        # what the percentile math produces on a weird sample
+        new_threshold = float(np.clip(new_threshold, 0.03, 0.6))
+        old_threshold = state.adaptive_threshold
+        state.adaptive_threshold = new_threshold
+        pct_clearing = float(np.mean(np.array(all_confidences) >= new_threshold)) * 100
+        print(f"[Calibrator] adaptive_threshold {old_threshold:.3f} -> {new_threshold:.3f} "
+              f"(P{ADAPTIVE_THRESHOLD_PERCENTILE} of {len(all_confidences)} samples, "
+              f"~{pct_clearing:.0f}% of replayed points would clear it)")
+    else:
+        print(f"[Calibrator] no confidence samples collected this cycle - "
+              f"keeping threshold at {state.adaptive_threshold:.3f}")
 
     state.last_scheduled_calibration = time.time()
     state.last_calibration_end = time.time()
+    state.last_activity = time.time()
     print(f"[Calibrator] complete in {state.last_calibration_end - start:.1f}s. Updated: {candidates}")
     state.trading_locked = False
 
@@ -1073,7 +1142,7 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
 # ---------------------------------------------------------------------------
 # STREAM CONSUMERS
 # ---------------------------------------------------------------------------
-async def tick_consumer(queue, symbol_data):
+async def tick_consumer(queue, symbol_data, state):
     while True:
         data = await queue.get()
         tick = data.get("tick")
@@ -1082,6 +1151,7 @@ async def tick_consumer(queue, symbol_data):
         symbol = tick.get("symbol")
         if symbol in symbol_data:
             symbol_data[symbol].add_tick(tick["epoch"], tick["quote"])
+        state.last_activity = time.time()
 
 
 async def balance_consumer(queue, state):
@@ -1090,6 +1160,22 @@ async def balance_consumer(queue, state):
         bal = data.get("balance")
         if bal:
             state.balance = bal["balance"]
+
+
+async def watchdog(state):
+    """If WATCHDOG_TIMEOUT seconds pass with no tick received and no main-loop
+    iteration completed (state.last_activity untouched), the process is
+    assumed locked up. Rather than depending on any specific host's restart
+    policy, this re-execs the current Python process in place - identical
+    behavior on Railway and on a local PC, no external supervisor needed."""
+    while True:
+        await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
+        idle = time.time() - state.last_activity
+        if idle > WATCHDOG_TIMEOUT:
+            print(f"[Watchdog] No activity for {idle:.0f}s (limit {WATCHDOG_TIMEOUT}s). "
+                  f"Restarting process in place now.")
+            sys.stdout.flush()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 # ---------------------------------------------------------------------------
@@ -1132,7 +1218,7 @@ async def main():
         await asyncio.sleep(3)
     if not symbols:
         raise RuntimeError("No tradable rise/fall symbols found (check API credentials/connectivity).")
-    print(f"Tradable universe ({len(symbols)} symbols, 1HZ excluded): {symbols}")
+    print(f"Tradable universe ({len(symbols)} symbols, R_ only, 1HZ excluded): {symbols}")
 
     symbol_data = {s: SymbolData(s) for s in symbols}
     print("Bootstrapping tick history for all symbols (this funds the initial calibration)...")
@@ -1156,15 +1242,18 @@ async def main():
     client.resubscribe_cb = subscribe_all
     await subscribe_all(client)
 
-    asyncio.create_task(tick_consumer(tick_queue, symbol_data))
+    asyncio.create_task(tick_consumer(tick_queue, symbol_data, state))
     asyncio.create_task(balance_consumer(balance_queue, state))
+    asyncio.create_task(watchdog(state))
 
     print("Running initial full-power calibration across the entire universe before trading begins...")
     await run_calibration(state, symbol_data, symbols, ("initial", None))
 
     print("Bot running. Entering main decision loop.")
+    last_heartbeat = 0.0
     while True:
         await asyncio.sleep(2)
+        state.last_activity = time.time()
 
         if state.trading_locked or state.trade_in_progress:
             continue
@@ -1175,6 +1264,15 @@ async def main():
             continue
 
         ready_symbols = [s for s in symbols if s in state.model_cache and len(symbol_data[s].ticks) >= MIN_TICKS_LIVE]
+
+        # heartbeat every ~30s so log silence is diagnosable as "no signal"
+        # rather than indistinguishable from a frozen process
+        now = time.time()
+        if now - last_heartbeat > 30:
+            print(f"[scan] balance={state.balance:.2f} | {len(ready_symbols)}/{len(symbols)} ready | "
+                  f"threshold={state.adaptive_threshold:.3f}")
+            last_heartbeat = now
+
         if not ready_symbols:
             continue
 
@@ -1189,7 +1287,7 @@ async def main():
             p_up, confidence = bayesian_fusion(feats)
             symbol_scores[s] = (p_up, confidence)
 
-        pick = select_trade(symbol_scores, state.reliability)
+        pick = select_trade(symbol_scores, state.reliability, state.adaptive_threshold)
         if not pick:
             continue
 
@@ -1199,12 +1297,30 @@ async def main():
         duration, exp_win_rate = monte_carlo_duration(
             sd.prices(), sd.returns(), direction, feats, CANDIDATE_DURATIONS
         )
+
+        if exp_win_rate < MIN_EXP_WIN_RATE:
+            print(
+                f"Skipping {symbol} dir={'UP' if direction > 0 else 'DOWN'} p_up={p_up:.3f} "
+                f"score={score:.3f} - best duration's simulated win rate ({exp_win_rate:.2f}) "
+                f"is below the {MIN_EXP_WIN_RATE} sanity floor, not trading against the model's own simulation."
+            )
+            continue
+
         print(
             f"Selected {symbol} dir={'UP' if direction > 0 else 'DOWN'} "
             f"p_up={p_up:.3f} score={score:.3f} duration={duration}t exp_win={exp_win_rate:.2f}"
         )
         await execute_sequence(client, state, symbol, direction, duration)
+        state.last_activity = time.time()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        print(f"[main] Unhandled exception, restarting process in place: {type(e).__name__}: {e}")
+        sys.stdout.flush()
+        time.sleep(3)  # brief pause so a fast crash loop doesn't hammer the API
+        os.execv(sys.executable, [sys.executable] + sys.argv)
