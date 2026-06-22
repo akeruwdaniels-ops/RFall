@@ -77,7 +77,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "")
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
-DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo").strip().lower()
+DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "real").strip().lower()
 DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID") or None
 
 # ── Connection (new Deriv Options API) ──
@@ -88,7 +88,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.24
+MARTINGALE_FACTOR = 1.12
 MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds (2 hours)
@@ -140,6 +140,22 @@ class TradeState:
         self.model_cache: Dict[str, "SymbolModels"] = {}
         self.adaptive_threshold = CONFIDENCE_THRESHOLD_DEFAULT
         self.last_activity = time.time()  # updated by ticks and main-loop iterations; watchdog reads this
+
+        # When a step loses, we don't chain immediately into the next step.
+        # Instead we return to the signal loop and wait for the next genuine
+        # qualifying opportunity.  This field carries the pending recovery
+        # context between those two events.
+        #
+        # None  = no recovery in progress, trade fresh at base stake
+        # dict  = {
+        #     "step":           next martingale step index (1, 2, or 3),
+        #     "base_stake":     the base_stake that was calculated at the
+        #                       START of this sequence (so every step uses
+        #                       the same ladder, not a moving-balance one),
+        #     "prev_symbol":    symbol that lost (logged, not binding on next entry)
+        #     "prev_direction": direction that lost (logged, not binding)
+        # }
+        self.recovery: Optional[dict] = None
 
 
 @dataclass
@@ -992,23 +1008,76 @@ def log_trade(symbol, direction, stake, won, profit, step):
     print(f"[{ts}] {symbol} {side} step={step} stake={stake:.2f} won={won} profit={profit:.2f}")
 
 
-async def execute_sequence(client, state, symbol, direction, duration):
+async def execute_one_step(client, state, symbol, direction, duration):
+    """Execute exactly ONE contract at the appropriate stake for the current
+    recovery step, then return.  The caller (main loop) is responsible for
+    waiting for the next qualifying signal before calling again.
+
+    Recovery logic:
+      - Fresh trade (state.recovery is None): use base stake, set up recovery
+        context so the next call knows it is step 1 if this loses.
+      - Recovery step (state.recovery is not None): use the pre-computed
+        ladder stake for state.recovery["step"].  On win, clear recovery.
+        On loss, increment step; if we have exhausted MARTINGALE_MAX_STEPS,
+        also clear recovery (sequence failed, start fresh).
+    """
     state.trade_in_progress = True
-    base_stake = calculate_stake(state.balance)
-    stakes = martingale_stakes(base_stake)
-    sequence_won = False
     try:
-        for step, stake in enumerate(stakes):
-            contract_id = await buy_contract(client, symbol, direction, duration, "t", stake)
-            won, profit = await wait_for_contract_result(client, contract_id)
-            log_trade(symbol, direction, stake, won, profit, step)
-            if won:
-                sequence_won = True
-                break
+        if state.recovery is None:
+            # --- fresh entry ---
+            base_stake = calculate_stake(state.balance)
+            stakes = martingale_stakes(base_stake)
+            step = 0
+            stake = stakes[0]
+        else:
+            # --- recovery entry ---
+            base_stake = state.recovery["base_stake"]
+            stakes = martingale_stakes(base_stake)
+            step = state.recovery["step"]
+            stake = stakes[step]
+            prev = state.recovery["prev_symbol"]
+            prev_dir = state.recovery["prev_direction"]
+            print(
+                f"[recovery] step={step}/{MARTINGALE_MAX_STEPS} "
+                f"stake={stake:.2f} (prev loss: {prev} {'UP' if prev_dir > 0 else 'DOWN'})"
+            )
+
+        contract_id = await buy_contract(client, symbol, direction, duration, "t", stake)
+        won, profit = await wait_for_contract_result(client, contract_id)
+        log_trade(symbol, direction, stake, won, profit, step)
+
+        if won:
+            # sequence complete — clear recovery regardless of which step we were on
+            state.recovery = None
+            state.consecutive_losses[symbol] = 0
+        else:
+            state.consecutive_losses[symbol] += 1
+            next_step = step + 1
+            if next_step > MARTINGALE_MAX_STEPS:
+                # exhausted the ladder, give up and start fresh next signal
+                print(
+                    f"[recovery] Exhausted {MARTINGALE_MAX_STEPS} recovery steps on {symbol}. "
+                    f"Clearing recovery — next trade starts fresh."
+                )
+                state.recovery = None
+            else:
+                # arm recovery: wait for next signal, then fire next step
+                state.recovery = {
+                    "step": next_step,
+                    "base_stake": base_stake,
+                    "prev_symbol": symbol,
+                    "prev_direction": direction,
+                }
+                dir_label = 'UP' if direction > 0 else 'DOWN'
+                print(
+                    f"[recovery] Loss on {symbol} {dir_label} step={step}. "
+                    f"Waiting for next signal — will trade step={next_step} "
+                    f"stake={stakes[next_step]:.2f} on whatever qualifies next."
+                )
+
     except Exception as e:
         print(f"Trade error on {symbol}: {e}")
-
-    state.consecutive_losses[symbol] = 0 if sequence_won else state.consecutive_losses[symbol] + 1
+        state.recovery = None  # don't carry corrupted recovery state forward
 
     try:
         bal_resp = await client.send({"balance": 1})
@@ -1195,7 +1264,7 @@ async def main():
     if DERIV_ACCOUNT_TYPE == "real":
         print("!" * 72)
         print("! DERIV_ACCOUNT_TYPE=real - this bot will trade with REAL MONEY.    !")
-        print("! Set DERIV_ACCOUNT_TYPE=demo (or unset it) to use a demo account.  !")
+        print("! Set DERIV_ACCOUNT_TYPE=real (or unset it) to use a demo account.  !")
         print("!" * 72)
 
     client = DerivClient(
@@ -1269,8 +1338,16 @@ async def main():
         # rather than indistinguishable from a frozen process
         now = time.time()
         if now - last_heartbeat > 30:
+            recovery_info = ""
+            if state.recovery:
+                r = state.recovery
+                base_stakes = martingale_stakes(r["base_stake"])
+                recovery_info = (
+                    f" | RECOVERY pending step={r['step']}/{MARTINGALE_MAX_STEPS} "
+                    f"stake={base_stakes[r['step']]:.2f}"
+                )
             print(f"[scan] balance={state.balance:.2f} | {len(ready_symbols)}/{len(symbols)} ready | "
-                  f"threshold={state.adaptive_threshold:.3f}")
+                  f"threshold={state.adaptive_threshold:.3f}{recovery_info}")
             last_heartbeat = now
 
         if not ready_symbols:
@@ -1306,11 +1383,12 @@ async def main():
             )
             continue
 
+        step_label = f"step={state.recovery['step']}" if state.recovery else "step=0 (fresh)"
         print(
             f"Selected {symbol} dir={'UP' if direction > 0 else 'DOWN'} "
-            f"p_up={p_up:.3f} score={score:.3f} duration={duration}t exp_win={exp_win_rate:.2f}"
+            f"p_up={p_up:.3f} score={score:.3f} duration={duration}t exp_win={exp_win_rate:.2f} | {step_label}"
         )
-        await execute_sequence(client, state, symbol, direction, duration)
+        await execute_one_step(client, state, symbol, direction, duration)
         state.last_activity = time.time()
 
 
