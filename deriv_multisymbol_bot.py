@@ -1,7 +1,7 @@
 """
 Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER
 ========================================================
-Single-file bot. Scans all eligible synthetic-index symbols (1HZ excluded),
+Single-file bot. Scans all eligible synthetic-index symbols (R_ excl. R_25, plus 1HZ variants),
 runs a 12-layer intelligence pipeline per symbol using REAL fitted
 statistical models (not heuristic approximations), fuses evidence into a
 single directional probability via Bayesian log-odds combination, auto-
@@ -123,6 +123,21 @@ WATCHDOG_CHECK_INTERVAL = 20           # how often the watchdog checks for stale
 MIN_TICKS_FOR_FIT = 200                # minimum ticks before a model can be fitted
 MIN_TICKS_LIVE = 60                    # minimum ticks before live layers (Markov etc.) run
 
+# ── Startup deep-calibration settings ──────────────────────────────────────
+# The initial calibration is far stricter than the ongoing 2-hour cycles.
+# It uses finer-grained walk-forward steps and pools across multiple training
+# folds to produce a large, stable confidence-sample set.  The adaptive
+# threshold is set at a higher percentile (more conservative) and a minimum
+# confidence-sample count is required before a symbol is eligible.  After
+# calibration completes, the bot also waits for STARTUP_LIVE_WARMUP_TICKS
+# fresh live ticks per symbol before it may be selected -- eliminating the
+# "first-tick excitement" risk where a stale bootstrapped tick looks like a
+# valid signal to a freshly fitted model.
+STARTUP_CALIBRATION_PERCENTILE = 75   # stricter bar for initial threshold (ongoing = 65th)
+STARTUP_MIN_CONF_SAMPLES       = 80   # min WFV evaluation points required per symbol at startup
+STARTUP_LIVE_WARMUP_TICKS      = 60   # live ticks per symbol to accumulate post-calibration
+                                       # before first trade allowed (~60-120 s for R_ symbols)
+
 
 # ---------------------------------------------------------------------------
 # SHARED STATE  (single source of truth - every module reads/writes through this)
@@ -177,9 +192,11 @@ class SymbolData:
     def __init__(self, symbol, maxlen=4000):
         self.symbol = symbol
         self.ticks = deque(maxlen=maxlen)  # (epoch, price)
+        self.live_tick_count = 0           # monotonically incrementing; never resets
 
     def add_tick(self, epoch, price):
         self.ticks.append((epoch, price))
+        self.live_tick_count += 1
 
     def prices(self):
         return np.array([p for _, p in self.ticks], dtype=float)
@@ -390,10 +407,11 @@ class DerivClient:
 
 
 async def fetch_tradable_symbols(client):
-    """Builds the symbol universe dynamically: R_ volatility indices ONLY
-    (R_10, R_25, R_50, R_75, R_100) - JD/stpRNG/RDBEAR/RDBULL families and all
-    1HZ variants are explicitly excluded, and only symbols that actually
-    support CALL/PUT contracts are kept.
+    """Builds the symbol universe dynamically: standard R_ volatility indices
+    (R_10, R_50, R_75, R_100 -- R_25 explicitly excluded) AND all 1HZ variants
+    (1HZ10V, 1HZ25V, 1HZ50V, 1HZ75V, 1HZ100V).  JD/stpRNG/RDBEAR/RDBULL
+    families remain excluded.  Only symbols that actually support CALL/PUT
+    contracts are kept.
 
     New API: `active_symbols` response field is `underlying_symbol` (renamed
     from `symbol`), and `contracts_for` no longer takes `currency`."""
@@ -405,16 +423,20 @@ async def fetch_tradable_symbols(client):
     candidates = []
     for s in resp.get("active_symbols", []):
         symbol = s.get("underlying_symbol")
-        if not symbol or "1HZ" in symbol:
+        if not symbol:
             continue
-        if not symbol.startswith("R_"):
+        is_r_variant = symbol.startswith("R_")
+        is_1hz       = symbol.startswith("1HZ")
+        if not (is_r_variant or is_1hz):
+            continue
+        if symbol == "R_25":          # excluded by configuration
             continue
         if s.get("market") != "synthetic_index":
             continue
         if not s.get("exchange_is_open", 1):
             continue
         candidates.append(symbol)
-    print(f"[fetch_tradable_symbols] {len(candidates)} R_ candidates before contracts_for check")
+    print(f"[fetch_tradable_symbols] {len(candidates)} R_/1HZ candidates before contracts_for check")
 
     verified = []
     cf_errors = []
@@ -1147,7 +1169,73 @@ def walk_forward_validate(sd, train_frac=0.8, horizon=5, step=5):
     return hit_rate, models, confidences
 
 
-async def run_calibration(state, symbol_data, symbols, trigger_reason):
+
+def walk_forward_validate_deep(sd, train_fracs=(0.65, 0.75, 0.85), horizons=(3, 5, 7), step=1):
+    """Deep multi-fold, multi-horizon walk-forward validation for startup only.
+
+    For each train_frac in `train_fracs`:
+      - Fits models on that fraction of the buffered data (expanding windows).
+      - Walks through the held-out remainder ONE TICK AT A TIME (step=1).
+      - Scores the predicted direction against every horizon in `horizons`.
+    All hits and confidence scores are pooled across folds and horizons.
+
+    This produces roughly 10-20x more evaluation points than the standard
+    walk_forward_validate (step=5, single fold, single horizon), giving the
+    adaptive threshold a stable empirical foundation before the first live
+    trade fires.  `best_models` comes from the fold with the highest hit rate
+    and is what gets cached for live scoring.
+    """
+    n_ticks = len(sd.ticks)
+    if n_ticks < MIN_TICKS_FOR_FIT + 100:
+        return 0.5, None, []
+
+    all_hits = []
+    all_confs = []
+    best_models = None
+    best_hit_rate = -1.0
+    max_horizon = max(horizons)
+
+    for train_frac in train_fracs:
+        split = max(MIN_TICKS_FOR_FIT, int(n_ticks * train_frac))
+        train_sd = sd.slice_copy(split)
+        models = fit_symbol_models(train_sd)
+        if not models.fitted:
+            continue
+
+        eval_sd = sd.slice_copy(split)
+        remaining = list(sd.ticks)[split:]
+        if len(remaining) < max_horizon + 1:
+            continue
+
+        fold_hits = []
+        fold_confs = []
+        for i in range(0, len(remaining) - max_horizon, step):
+            eval_sd.add_tick(*remaining[i])
+            feats = compute_features(eval_sd, models, {sd.symbol: eval_sd.returns()})
+            if feats is None:
+                continue
+            p_up, confidence = bayesian_fusion(feats)
+            fold_confs.append(confidence)
+            predicted_dir = 1 if p_up > 0.5 else -1
+            current_price = remaining[i][1]
+            for h in horizons:
+                future_price = remaining[i + h][1]
+                actual_dir = 1 if future_price > current_price else -1
+                fold_hits.append(int(predicted_dir == actual_dir))
+
+        if fold_hits:
+            fold_hit_rate = sum(fold_hits) / len(fold_hits)
+            all_hits.extend(fold_hits)
+            all_confs.extend(fold_confs)
+            if fold_hit_rate > best_hit_rate:
+                best_hit_rate = fold_hit_rate
+                best_models = models
+
+    overall_hit_rate = sum(all_hits) / len(all_hits) if all_hits else 0.5
+    return overall_hit_rate, best_models, all_confs
+
+
+async def run_calibration(state, symbol_data, symbols, trigger_reason, deep=False):
     state.trading_locked = True
     kind, loss_symbol = trigger_reason
     start = time.time()
@@ -1176,17 +1264,27 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
         if len(sd.ticks) < MIN_TICKS_FOR_FIT + 100:
             print(f"[Calibrator] {s}: not enough ticks yet, skipping this cycle.")
             continue
-        hit_rate, models, confidences = walk_forward_validate(sd)
+        hit_rate, models, confidences = (
+            walk_forward_validate_deep(sd) if deep else walk_forward_validate(sd)
+        )
+        if deep and len(confidences) < STARTUP_MIN_CONF_SAMPLES:
+            print(
+                f"[Calibrator] {s}: only {len(confidences)} confidence samples "
+                f"(need {STARTUP_MIN_CONF_SAMPLES} for full startup gate) -- "
+                f"model cached; symbol will clear on live warmup."
+            )
         if models is not None:
             state.model_cache[s] = models
         state.reliability[s] = float(np.clip(hit_rate / 0.5, 0.3, 1.5))
         state.consecutive_losses[s] = 0
         all_confidences.extend(confidences)
-        print(f"[Calibrator] {s}: walk-forward hit_rate={hit_rate:.3f} reliability={state.reliability[s]:.2f} "
+        val_label = "deep walk-forward" if deep else "walk-forward"
+        print(f"[Calibrator] {s}: {val_label} hit_rate={hit_rate:.3f} reliability={state.reliability[s]:.2f} "
               f"n_confidence_samples={len(confidences)}")
 
     if all_confidences:
-        new_threshold = float(np.percentile(all_confidences, ADAPTIVE_THRESHOLD_PERCENTILE))
+        active_percentile = STARTUP_CALIBRATION_PERCENTILE if deep else ADAPTIVE_THRESHOLD_PERCENTILE
+        new_threshold = float(np.percentile(all_confidences, active_percentile))
         # never let the bar collapse to ~0 (untradeable noise floor) or demand
         # near-impossible confidence - keep it in a sane band regardless of
         # what the percentile math produces on a weird sample
@@ -1194,8 +1292,9 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
         old_threshold = state.adaptive_threshold
         state.adaptive_threshold = new_threshold
         pct_clearing = float(np.mean(np.array(all_confidences) >= new_threshold)) * 100
+        depth_tag = " [DEEP-STARTUP]" if deep else ""
         print(f"[Calibrator] adaptive_threshold {old_threshold:.3f} -> {new_threshold:.3f} "
-              f"(P{ADAPTIVE_THRESHOLD_PERCENTILE} of {len(all_confidences)} samples, "
+              f"(P{active_percentile}{depth_tag} of {len(all_confidences)} samples, "
               f"~{pct_clearing:.0f}% of replayed points would clear it)")
     else:
         print(f"[Calibrator] no confidence samples collected this cycle - "
@@ -1287,7 +1386,7 @@ async def main():
         await asyncio.sleep(3)
     if not symbols:
         raise RuntimeError("No tradable rise/fall symbols found (check API credentials/connectivity).")
-    print(f"Tradable universe ({len(symbols)} symbols, R_ only, 1HZ excluded): {symbols}")
+    print(f"Tradable universe ({len(symbols)} symbols -- R_ excl. R_25, plus 1HZ variants): {symbols}")
 
     symbol_data = {s: SymbolData(s) for s in symbols}
     print("Bootstrapping tick history for all symbols (this funds the initial calibration)...")
@@ -1315,8 +1414,30 @@ async def main():
     asyncio.create_task(balance_consumer(balance_queue, state))
     asyncio.create_task(watchdog(state))
 
-    print("Running initial full-power calibration across the entire universe before trading begins...")
-    await run_calibration(state, symbol_data, symbols, ("initial", None))
+    print(
+        "Running DEEP startup calibration across the entire universe.\n"
+        "  - Multi-fold walk-forward (train fracs 0.65 / 0.75 / 0.85)\n"
+        "  - Step=1: every tick in the held-out window is evaluated\n"
+        "  - Multi-horizon scoring (3 / 5 / 7 ticks ahead)\n"
+        f"  - Threshold will be set at stricter P{STARTUP_CALIBRATION_PERCENTILE} "
+        f"(ongoing cycles use P{ADAPTIVE_THRESHOLD_PERCENTILE})\n"
+        f"  - Trading gated until each symbol accumulates {STARTUP_LIVE_WARMUP_TICKS} live ticks "
+        "post-calibration.\n"
+        "This takes longer than a normal calibration cycle -- be patient."
+    )
+    await run_calibration(state, symbol_data, symbols, ("initial", None), deep=True)
+
+    # Snapshot live tick counts at the moment initial calibration completes.
+    # The main loop uses this to enforce STARTUP_LIVE_WARMUP_TICKS of fresh
+    # real-time data per symbol before the first trade is allowed, preventing
+    # "first-tick excitement" where a stale bootstrapped price still looks
+    # like a valid signal to a freshly fitted model.
+    startup_live_ticks: dict = {s: symbol_data[s].live_tick_count for s in symbols}
+    print(
+        f"Deep startup calibration complete. Each symbol must now accumulate "
+        f"{STARTUP_LIVE_WARMUP_TICKS} live ticks before trading begins.\n"
+        "Bot entering main decision loop -- observation-only until warmup clears."
+    )
 
     print("Bot running. Entering main decision loop.")
     last_heartbeat = 0.0
@@ -1334,6 +1455,24 @@ async def main():
 
         ready_symbols = [s for s in symbols if s in state.model_cache and len(symbol_data[s].ticks) >= MIN_TICKS_LIVE]
 
+        # ── Startup live-warmup gate ────────────────────────────────────────
+        # Cleared permanently once all symbols cross STARTUP_LIVE_WARMUP_TICKS.
+        # Until then, symbols that haven't yet accumulated enough fresh ticks
+        # since the initial deep calibration are excluded from trade selection.
+        if startup_live_ticks:
+            ready_symbols = [
+                s for s in ready_symbols
+                if symbol_data[s].live_tick_count - startup_live_ticks.get(s, 0)
+                >= STARTUP_LIVE_WARMUP_TICKS
+            ]
+            if all(
+                symbol_data[s].live_tick_count - startup_live_ticks.get(s, 0)
+                >= STARTUP_LIVE_WARMUP_TICKS
+                for s in symbols
+            ):
+                startup_live_ticks = {}   # all symbols warmed up -- drop gate permanently
+                print("[warmup] All symbols cleared the startup live-warmup gate. Trading enabled.")
+
         # heartbeat every ~30s so log silence is diagnosable as "no signal"
         # rather than indistinguishable from a frozen process
         now = time.time()
@@ -1346,8 +1485,21 @@ async def main():
                     f" | RECOVERY pending step={r['step']}/{MARTINGALE_MAX_STEPS} "
                     f"stake={base_stakes[r['step']]:.2f}"
                 )
-            print(f"[scan] balance={state.balance:.2f} | {len(ready_symbols)}/{len(symbols)} ready | "
-                  f"threshold={state.adaptive_threshold:.3f}{recovery_info}")
+            if startup_live_ticks:
+                warmup_progress = {
+                    s: symbol_data[s].live_tick_count - startup_live_ticks.get(s, 0)
+                    for s in symbols
+                }
+                min_prog  = min(warmup_progress.values())
+                n_warmed  = sum(1 for v in warmup_progress.values() if v >= STARTUP_LIVE_WARMUP_TICKS)
+                print(
+                    f"[scan] WARMUP {n_warmed}/{len(symbols)} symbols cleared "
+                    f"({min_prog}/{STARTUP_LIVE_WARMUP_TICKS} ticks min) | "
+                    f"balance={state.balance:.2f} | threshold={state.adaptive_threshold:.3f}"
+                )
+            else:
+                print(f"[scan] balance={state.balance:.2f} | {len(ready_symbols)}/{len(symbols)} ready | "
+                      f"threshold={state.adaptive_threshold:.3f}{recovery_info}")
             last_heartbeat = now
 
         if not ready_symbols:
