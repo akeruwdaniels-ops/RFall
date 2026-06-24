@@ -88,8 +88,8 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.31
-MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
+MARTINGALE_FACTOR = 1.35
+MARTINGALE_MAX_STEPS = 4               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
@@ -107,8 +107,8 @@ MIN_SCORE_GAP = 0.05
 # 12/16 layers must agree (75% supermajority). No more than 3 allowed to
 # actively oppose. This eliminates all the 9-agree / 5-disagree borderline
 # entries that the logs showed were the source of losses.
-MIN_LAYER_AGREE    = 10                # minimum layers voting FOR direction (75% of 16)
-MAX_LAYER_DISAGREE = 4                 # maximum layers allowed to vote AGAINST
+MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (75% of 16)
+MAX_LAYER_DISAGREE = 3                 # maximum layers allowed to vote AGAINST
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
 # Raised from 0.45 → 0.52: the best simulated duration must show a meaningful
