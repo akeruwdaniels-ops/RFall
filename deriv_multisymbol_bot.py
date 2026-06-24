@@ -1520,14 +1520,14 @@ def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
     print(sep + "\n")
 
 
-async def execute_single_step(client, state, symbol, direction, stake, step):
+async def execute_single_step(client, state, symbol, direction, stake, step, duration=5):
     """Places exactly ONE trade and returns. Never loops to the next martingale
     step — that decision belongs to the main signal loop, which waits for a
     genuine quality entry before placing any recovery step."""
     state.trade_in_progress = True
     won, profit = False, 0.0
     try:
-        contract_id = await buy_contract(client, symbol, direction, stake, "t", stake)
+        contract_id = await buy_contract(client, symbol, direction, int(duration), "t", stake)
         won, profit = await wait_for_contract_result(client, contract_id)
         log_trade(symbol, direction, stake, won, profit, step)
     except Exception as e:
@@ -2216,7 +2216,8 @@ async def main():
 
             won, _ = await execute_single_step(
                 client, state, rec_sym,
-                state.recovery_direction, state.recovery_stake, state.recovery_step
+                state.recovery_direction, state.recovery_stake, state.recovery_step,
+                duration=duration
             )
 
             if won:
@@ -2288,7 +2289,7 @@ async def main():
         )
 
         won, _ = await execute_single_step(
-            client, state, symbol, direction, base_stake, 0
+            client, state, symbol, direction, base_stake, 0, duration=duration
         )
 
         if won:
