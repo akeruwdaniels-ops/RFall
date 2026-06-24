@@ -88,7 +88,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.24
+MARTINGALE_FACTOR = 1.99
 MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds (2 hours)
@@ -108,8 +108,8 @@ MIN_SCORE_GAP = 0.03                   # required gap over runner-up symbol
 # the chosen direction. With 16 scored layers, requiring >=10 agree means
 # at least 62.5% consensus. Raise MIN_LAYER_AGREE to demand stronger
 # unanimity; lower it cautiously (never below 9 on 16 layers = bare majority).
-MIN_LAYER_AGREE    = 10                # minimum layers that must vote FOR the direction
-MAX_LAYER_DISAGREE = 5                 # maximum layers allowed to vote AGAINST
+MIN_LAYER_AGREE    = 9                # minimum layers that must vote FOR the direction
+MAX_LAYER_DISAGREE = 6                 # maximum layers allowed to vote AGAINST
 
 # ── Post-loss deep recalibration ──────────────────────────────────────────
 # After a step=0 loss, trigger a full deep recalibration before seeking the
@@ -120,7 +120,7 @@ POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled rec
 CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks - Deriv rejects tick contracts outside 1-10,
                                           # this was the cause of the repeated "Number of ticks
                                           # must be between 1 and 10" trade errors
-MC_SIMULATIONS = 500
+MC_SIMULATIONS = 5000
 MIN_EXP_WIN_RATE = 0.45                # Monte Carlo sanity gate: if even the BEST candidate
                                         # duration's simulated win rate is below this, skip the
                                         # trade entirely rather than firing on a duration the
