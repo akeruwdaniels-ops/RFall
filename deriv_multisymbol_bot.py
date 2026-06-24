@@ -102,6 +102,21 @@ CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only - real threshold is set a
                                         # the calibrator from the observed score distribution
                                         # (see ADAPTIVE_THRESHOLD_PERCENTILE below)
 MIN_SCORE_GAP = 0.03                   # required gap over runner-up symbol
+
+# ── Layer agreement gate ──────────────────────────────────────────────────
+# A trade is only taken when the majority of intelligence layers agree with
+# the chosen direction. With 16 scored layers, requiring >=10 agree means
+# at least 62.5% consensus. Raise MIN_LAYER_AGREE to demand stronger
+# unanimity; lower it cautiously (never below 9 on 16 layers = bare majority).
+MIN_LAYER_AGREE    = 10                # minimum layers that must vote FOR the direction
+MAX_LAYER_DISAGREE = 5                 # maximum layers allowed to vote AGAINST
+
+# ── Post-loss deep recalibration ──────────────────────────────────────────
+# After a step=0 loss, trigger a full deep recalibration before seeking the
+# next entry (clears directional/symbol bias, re-fits all models on fresh data).
+# This runs regardless of MARTINGALE_MAX_STEPS. Recovery steps after step=0
+# still use the freshly calibrated models.
+POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled recal only)
 CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks - Deriv rejects tick contracts outside 1-10,
                                           # this was the cause of the repeated "Number of ticks
                                           # must be between 1 and 10" trade errors
@@ -1190,6 +1205,34 @@ def compute_features(sd, models, returns_window_dict):
     # Expressed as a centred signal so it contributes its own log-odds term
     hurst_signal = float(np.clip((h - 0.5) * 4, -1, 1))   # +1 at H=0.75, -1 at H=0.25
 
+    # ── Layer agreement pre-computation ──────────────────────────────────
+    # Compute agree/disagree counts here (not just in explain_signal) so the
+    # main loop can enforce the MIN_LAYER_AGREE / MAX_LAYER_DISAGREE gates
+    # before committing to a trade. direction is unknown at this point, so we
+    # compute counts for both sides and let the caller choose the right set.
+    _layer_votes = [
+        (markov_p - 0.5) * 2,          # Markov
+        hmm_lean,                        # HMM
+        hawkes_sig,                      # Hawkes
+        ou["reversion_dir"] * ou["strength"],  # OU
+        hurst_signal,                    # Hurst
+        arfima,                          # ARFIMA
+        kalman,                          # Kalman
+        (copula - 0.5) * 2,             # Copula
+        rsi_signal,                      # RSI
+        srsi_signal,                     # StochRSI
+        adx_dir * adx_trend,            # ADX
+        boll_signal,                     # Bollinger
+        z_signal,                        # Z-score
+        te_signal,                       # Transfer entropy
+        jump_dir * jump_intensity,       # Jump direction
+        post_jump * jump_intensity,      # Post-jump reversion
+    ]
+    # agree_up / disagree_up: counts from the perspective of a CALL trade
+    _agree_up    = sum(1 for v in _layer_votes if v > 0)
+    _disagree_up = sum(1 for v in _layer_votes if v < 0)
+    _neutral     = len(_layer_votes) - _agree_up - _disagree_up
+
     return {
         # fitted-model layers
         "markov_p":     markov_p,
@@ -1222,6 +1265,11 @@ def compute_features(sd, models, returns_window_dict):
         "post_jump":    post_jump,
         # pass through for calibration weight lookup
         "per_layer_weights": models.per_layer_weights,
+        # layer vote counts (direction-agnostic: agree_up = votes for CALL)
+        "agree_up":    _agree_up,
+        "disagree_up": _disagree_up,
+        "n_neutral":   _neutral,
+        "n_layers":    len(_layer_votes),
     }
 
 
@@ -1342,6 +1390,30 @@ def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
         if best is None or blended > best[1]:
             best = (dur, blended)
     return best
+
+
+# ---------------------------------------------------------------------------
+# LAYER AGREEMENT GATE
+# ---------------------------------------------------------------------------
+def passes_layer_gate(feats, direction):
+    """Returns (passes: bool, agree: int, disagree: int, neutral: int).
+
+    Uses the pre-computed vote counts from compute_features. For a CALL
+    (direction=+1) the agree count is agree_up; for a PUT (direction=-1)
+    it's disagree_up (those layers voted against CALL = voted for PUT).
+
+    Gate: agree >= MIN_LAYER_AGREE AND disagree <= MAX_LAYER_DISAGREE.
+    A trade with 10 agree / 4 disagree clears; one with 7 agree / 7 disagree
+    does not regardless of how high the Bayesian confidence score is."""
+    if direction > 0:
+        agree    = feats["agree_up"]
+        disagree = feats["disagree_up"]
+    else:
+        agree    = feats["disagree_up"]   # votes against CALL = votes FOR PUT
+        disagree = feats["agree_up"]
+    neutral  = feats["n_neutral"]
+    passes   = (agree >= MIN_LAYER_AGREE) and (disagree <= MAX_LAYER_DISAGREE)
+    return passes, agree, disagree, neutral
 
 
 # ---------------------------------------------------------------------------
@@ -2208,6 +2280,14 @@ async def main():
             if exp_win_rate < MIN_EXP_WIN_RATE:
                 continue
 
+            # Layer agreement gate applies to recovery steps too
+            gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats, state.recovery_direction)
+            if not gate_ok:
+                print(f"[Gate/Recovery] {rec_sym} step={state.recovery_step} waiting — "
+                      f"layer vote {n_agree}/{feats['n_layers']} agree, "
+                      f"{n_disagree} disagree, {n_neutral} neutral")
+                continue
+
             explain_signal(
                 symbol=rec_sym, direction=state.recovery_direction,
                 feats=feats, p_up=p_up, confidence=confidence,
@@ -2276,6 +2356,14 @@ async def main():
             print(f"Skipping {symbol} — MC best win rate {exp_win_rate:.2f} below floor.")
             continue
 
+        # ── Layer agreement gate ────────────────────────────────────────────
+        gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats, direction)
+        if not gate_ok:
+            print(f"[Gate] {symbol} skipped — layer vote {n_agree} agree / "
+                  f"{n_disagree} disagree / {n_neutral} neutral "
+                  f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree)")
+            continue
+
         base_stake = calculate_stake(state.balance)
         all_stakes = martingale_stakes(base_stake)
 
@@ -2296,20 +2384,26 @@ async def main():
             state.consecutive_losses[symbol] = 0
             emit_sequence_summary(state, symbol, direction, True)
         else:
+            # ── Post-step=0-loss deep recalibration ────────────────────────
+            # Re-fit ALL symbols on fresh data before the next entry. This
+            # clears any stale directional bias and resets per-symbol
+            # thresholds. Recovery steps (if MARTINGALE_MAX_STEPS >= 1) will
+            # still fire after this, but will use the freshly calibrated models.
+            if POST_LOSS_DEEP_RECAL:
+                print(f"[Recovery] step=0 lost on {symbol} — "
+                      f"triggering deep recalibration before recovery.")
+                await deep_startup_calibration(state, symbol_data, symbols)
+
             if MARTINGALE_MAX_STEPS >= 1:
                 state.recovery_symbol    = symbol
                 state.recovery_direction = direction
                 state.recovery_step      = 1
                 state.recovery_stake     = all_stakes[1]
-                print(f"[Recovery] step=0 lost on {symbol} — "
-                      f"waiting for signal before step=1 stake={all_stakes[1]:.2f}")
+                print(f"[Recovery] Armed: waiting for fresh signal before "
+                      f"step=1 stake={all_stakes[1]:.2f} on any symbol/direction.")
             else:
                 state.consecutive_losses[symbol] += 1
                 emit_sequence_summary(state, symbol, direction, False)
-                # martingale disabled — still recalibrate after a loss so the
-                # next entry uses fresh models across all symbols/directions
-                print(f"[Recovery] Single-step loss on {symbol} — triggering deep recalibration.")
-                await deep_startup_calibration(state, symbol_data, symbols)
 
         state.last_activity = time.time()
 
