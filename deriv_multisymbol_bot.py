@@ -107,7 +107,7 @@ MIN_SCORE_GAP = 0.05
 # 12/16 layers must agree (75% supermajority). No more than 3 allowed to
 # actively oppose. This eliminates all the 9-agree / 5-disagree borderline
 # entries that the logs showed were the source of losses.
-MIN_LAYER_AGREE    = 11                # minimum layers voting FOR direction (75% of 16)
+MIN_LAYER_AGREE    = 9                # minimum layers voting FOR direction (75% of 16)
 MAX_LAYER_DISAGREE = 4                 # maximum layers allowed to vote AGAINST
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
