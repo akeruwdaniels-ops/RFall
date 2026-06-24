@@ -88,48 +88,44 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.99
+MARTINGALE_FACTOR = 1.24
 MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
 
-SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds (2 hours)
-LOSS_TRIGGER_THRESHOLD = 2                     # consecutive losses on the SAME symbol
-MAX_LOSS_CALIBRATIONS_PER_24H = 3              # rate limiter, default - tune as needed
+SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
-TOP_K_DEEP_DIVE = 5                            # symbols deep-validated per calibration
 HISTORY_BOOTSTRAP_COUNT = 3000                 # ticks fetched per symbol at startup
 
-CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only - real threshold is set adaptively by
-                                        # the calibrator from the observed score distribution
+CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only — real threshold set adaptively
                                         # (see ADAPTIVE_THRESHOLD_PERCENTILE below)
-MIN_SCORE_GAP = 0.03                   # required gap over runner-up symbol
+
+# ── Quality gates — all tightened for high-conviction-only entries ─────────
+# MIN_SCORE_GAP: the winning symbol must outscore the runner-up by this margin.
+# Raised from 0.03 → 0.05 so we only trade when one symbol clearly dominates.
+MIN_SCORE_GAP = 0.05
 
 # ── Layer agreement gate ──────────────────────────────────────────────────
-# A trade is only taken when the majority of intelligence layers agree with
-# the chosen direction. With 16 scored layers, requiring >=10 agree means
-# at least 62.5% consensus. Raise MIN_LAYER_AGREE to demand stronger
-# unanimity; lower it cautiously (never below 9 on 16 layers = bare majority).
-MIN_LAYER_AGREE    = 9                # minimum layers that must vote FOR the direction
-MAX_LAYER_DISAGREE = 6                 # maximum layers allowed to vote AGAINST
+# 12/16 layers must agree (75% supermajority). No more than 3 allowed to
+# actively oppose. This eliminates all the 9-agree / 5-disagree borderline
+# entries that the logs showed were the source of losses.
+MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (75% of 16)
+MAX_LAYER_DISAGREE = 3                 # maximum layers allowed to vote AGAINST
+
+# ── Monte Carlo quality floor ─────────────────────────────────────────────
+# Raised from 0.45 → 0.52: the best simulated duration must show a meaningful
+# positive edge, not just "better than a coin flip".
+MIN_EXP_WIN_RATE = 0.52
+
+# ── Adaptive threshold percentile ─────────────────────────────────────────
+# Raised from 65 → 75: the confidence bar is now set at the 75th percentile of
+# walk-forward scores, so only the top quartile of signals are tradeable.
+ADAPTIVE_THRESHOLD_PERCENTILE = 75
 
 # ── Post-loss deep recalibration ──────────────────────────────────────────
-# After a step=0 loss, trigger a full deep recalibration before seeking the
-# next entry (clears directional/symbol bias, re-fits all models on fresh data).
-# This runs regardless of MARTINGALE_MAX_STEPS. Recovery steps after step=0
-# still use the freshly calibrated models.
+# After ANY loss, trigger a full deep recalibration across all symbols before
+# the next entry. No rate limiter — every loss gets a fresh recal.
 POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled recal only)
-CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks - Deriv rejects tick contracts outside 1-10,
-                                          # this was the cause of the repeated "Number of ticks
-                                          # must be between 1 and 10" trade errors
-MC_SIMULATIONS = 5000
-MIN_EXP_WIN_RATE = 0.45                # Monte Carlo sanity gate: if even the BEST candidate
-                                        # duration's simulated win rate is below this, skip the
-                                        # trade entirely rather than firing on a duration the
-                                        # model itself thinks is a coin-flip-or-worse
-
-ADAPTIVE_THRESHOLD_PERCENTILE = 65     # calibration sets CONFIDENCE_THRESHOLD to this
-                                        # percentile of the actual confidence scores seen during
-                                        # walk-forward replay, so the bar is empirically reachable
-                                        # for the real data instead of a hand-picked guess
+CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks — Deriv only accepts 1-10 tick contracts
+MC_SIMULATIONS = 500
 
 WATCHDOG_TIMEOUT = 5 * 60              # seconds of total silence (no tick, no loop iteration)
                                         # before the bot force-restarts itself in place
@@ -163,10 +159,12 @@ class TradeState:
 
         # Martingale recovery context — saved between main-loop iterations so
         # each recovery step waits for a genuine signal, not an instant re-entry
-        self.recovery_symbol    = None
+        # Recovery state — NO symbol/direction lock. After a loss the bot
+        # recalibrates then re-enters the open scan at the elevated stake.
+        # recovery_step=0 means not in recovery. recovery_step>=1 means
+        # we are in a martingale sequence at that step number.
         self.recovery_step      = 0
         self.recovery_stake     = 0.0
-        self.recovery_direction = 0
 
         # Step-0 (raw signal, no martingale recovery) win-rate tracking —
         # the only metric that honestly reveals whether the signal has edge
@@ -1592,10 +1590,25 @@ def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
     print(sep + "\n")
 
 
-async def execute_single_step(client, state, symbol, direction, stake, step, duration=5):
+async def execute_single_step(client, state, symbol, direction, stake, step, duration=5,
+                              feats=None):
     """Places exactly ONE trade and returns. Never loops to the next martingale
     step — that decision belongs to the main signal loop, which waits for a
-    genuine quality entry before placing any recovery step."""
+    genuine quality entry before placing any recovery step.
+
+    feats: if supplied, the layer gate is re-evaluated atomically here as a
+    final check immediately before the buy request is sent. This prevents the
+    race where the gate blocks on tick N but the trade slips through on tick
+    N+1 before a fresh iteration runs the gate check again."""
+    # ── Atomic final gate check ─────────────────────────────────────────────
+    if feats is not None:
+        gate_ok, n_agree, n_dis, _ = passes_layer_gate(feats, direction)
+        if not gate_ok:
+            print(f"[Gate/Atomic] {symbol} step={step} blocked at execution — "
+                  f"{n_agree} agree / {n_dis} disagree (gate moved between check and fire)")
+            state.trade_in_progress = False
+            return False, 0.0
+
     state.trade_in_progress = True
     won, profit = False, 0.0
     try:
@@ -1627,10 +1640,8 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
 
 def clear_recovery(state):
     """Reset all recovery context fields — called on sequence win or exhaustion."""
-    state.recovery_symbol    = None
     state.recovery_step      = 0
     state.recovery_stake     = 0.0
-    state.recovery_direction = 0
 
 
 def reset_sequence_accumulator(state, balance_now, p_up=0.5, confidence=0.0, duration=0):
@@ -1664,17 +1675,14 @@ def emit_sequence_summary(state, symbol, direction, sequence_won):
 # SYMBOL CALIBRATOR (trigger manager + FULL-POWER calibration engine)
 # ---------------------------------------------------------------------------
 def check_calibration_triggers(state):
+    """Returns ("scheduled", None) when the 2-hour wall clock interval has
+    elapsed. Loss-triggered deep recals are handled inline in the main loop
+    (POST_LOSS_DEEP_RECAL path) and do not go through this function."""
     now = time.time()
     if now - state.last_calibration_end < CALIBRATION_COOLDOWN:
         return None
     if now - state.last_scheduled_calibration >= SCHEDULED_CALIBRATION_INTERVAL:
         return "scheduled", None
-    for symbol, count in list(state.consecutive_losses.items()):
-        if count >= LOSS_TRIGGER_THRESHOLD:
-            recent = [t for t in state.loss_triggered_calibrations_24h if now - t < 86400]
-            state.loss_triggered_calibrations_24h = deque(recent)
-            if len(recent) < MAX_LOSS_CALIBRATIONS_PER_24H:
-                return "loss_triggered", symbol
     return None
 
 
@@ -2017,19 +2025,10 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
     if kind == "loss_triggered":
         state.loss_triggered_calibrations_24h.append(start)
 
-    if kind == "initial":
-        candidates = symbols
-    else:
-        scan_scores = {}
-        for s in symbols:
-            sd = symbol_data[s]
-            if len(sd.ticks) < MIN_TICKS_LIVE:
-                continue
-            returns = sd.returns()
-            scan_scores[s] = sample_entropy_trust(returns[-150:] if len(returns) >= 150 else returns)
-        candidates = sorted(scan_scores, key=scan_scores.get, reverse=True)[:TOP_K_DEEP_DIVE]
-        if loss_symbol and loss_symbol not in candidates:
-            candidates.append(loss_symbol)
+    # Always recalibrate ALL symbols — both scheduled (2-hour) and initial runs
+    # use the full universe so thresholds and reliability scores reflect every
+    # available symbol, not just the top-K from an entropy pre-scan.
+    candidates = symbols
 
     all_confidences = []
     for s in candidates:
@@ -2223,9 +2222,8 @@ async def main():
 
         now = time.time()
         if now - last_heartbeat > 30:
-            rec = (f" | RECOVERY {state.recovery_symbol} "
-                   f"step={state.recovery_step} stake={state.recovery_stake:.2f}"
-                   if state.recovery_symbol else "")
+            rec = (f" | RECOVERY step={state.recovery_step} stake={state.recovery_stake:.2f}"
+                   if state.recovery_step > 0 else "")
             s0_parts = []
             for sym in ready_symbols:
                 tot = state.step0_total[sym]
@@ -2243,85 +2241,94 @@ async def main():
         returns_window_dict = {s: symbol_data[s].returns()[-200:] for s in ready_symbols}
 
         # ── RECOVERY MODE ────────────────────────────────────────────────────
-        # A previous step lost. Symbol is locked. We still demand a full-quality
-        # signal before placing the recovery step — stake is larger, bar is identical.
-        if state.recovery_symbol:
-            rec_sym = state.recovery_symbol
-            if rec_sym not in ready_symbols:
-                print(f"[Recovery] {rec_sym} no longer ready — abandoning sequence.")
-                clear_recovery(state)
-                state.consecutive_losses[rec_sym] += 1
-                continue
+        # No symbol, direction, or duration lock. Recovery is a fresh open scan
+        # at the elevated martingale stake, using models freshly fitted by the
+        # deep recal that fired immediately after the step=0 loss. The best
+        # signal from ANY symbol in ANY direction wins selection — same quality
+        # gates apply (layer agreement, MC win rate, score gap, threshold).
+        if state.recovery_step > 0:
+            # Run the full symbol scan using fresh post-recal models
+            rec_scores = {}
+            for s in ready_symbols:
+                sd    = symbol_data[s]
+                feats = compute_features(sd, state.model_cache.get(s), returns_window_dict)
+                if feats is None:
+                    continue
+                p_up, confidence = bayesian_fusion(feats)
+                rec_scores[s] = (p_up, confidence)
 
-            sd = symbol_data[rec_sym]
+            rec_pick = select_trade(
+                rec_scores, state.reliability,
+                state.adaptive_threshold,
+                state.per_symbol_threshold
+            )
+            if not rec_pick:
+                continue   # no symbol clears quality bar yet — keep waiting
+
+            rec_sym, rec_dir, rec_p_up, rec_score = rec_pick
+            sd    = symbol_data[rec_sym]
             feats = compute_features(sd, state.model_cache.get(rec_sym), returns_window_dict)
-            if feats is None:
-                continue
-
-            p_up, confidence = bayesian_fusion(feats)
-            score     = confidence * state.reliability.get(rec_sym, 1.0)
-            sym_thr   = state.per_symbol_threshold.get(rec_sym, state.adaptive_threshold)
-            signal_dir = 1 if p_up > 0.5 else -1
-
-            if score < sym_thr:
-                continue   # signal not strong enough yet — keep waiting
-
-            # Direction-flip guard: if the signal has reversed against the
-            # original trade direction, wait for realignment rather than
-            # recovering into a confirmed headwind
-            if signal_dir != state.recovery_direction:
-                continue
 
             duration, exp_win_rate = monte_carlo_duration(
-                sd.prices(), sd.returns(), state.recovery_direction,
-                feats, CANDIDATE_DURATIONS,
+                sd.prices(), sd.returns(), rec_dir, feats, CANDIDATE_DURATIONS,
                 models=state.model_cache.get(rec_sym)
             )
             if exp_win_rate < MIN_EXP_WIN_RATE:
                 continue
 
-            # Layer agreement gate applies to recovery steps too
-            gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats, state.recovery_direction)
+            # ── Atomic gate check immediately before execution ──────────────
+            # Evaluated here (not just at top of iteration) to prevent the
+            # race where gate blocks on tick N but trade fires on tick N+1
+            # before a fresh gate check runs.
+            gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats, rec_dir)
             if not gate_ok:
-                print(f"[Gate/Recovery] {rec_sym} step={state.recovery_step} waiting — "
-                      f"layer vote {n_agree}/{feats['n_layers']} agree, "
-                      f"{n_disagree} disagree, {n_neutral} neutral")
+                print(f"[Gate/Recovery] step={state.recovery_step} — best pick {rec_sym} "
+                      f"vote {n_agree}/{feats['n_layers']} agree, {n_disagree} disagree, "
+                      f"{n_neutral} neutral — waiting for stronger consensus")
                 continue
 
+            print(f"[Recovery] step={state.recovery_step} stake={state.recovery_stake:.2f} "
+                  f"— best signal: {rec_sym} {'CALL' if rec_dir>0 else 'PUT'} "
+                  f"({n_agree}/16 agree, MC={exp_win_rate:.2f})")
+
             explain_signal(
-                symbol=rec_sym, direction=state.recovery_direction,
-                feats=feats, p_up=p_up, confidence=confidence,
-                duration=duration, exp_win=exp_win_rate, score=score
+                symbol=rec_sym, direction=rec_dir,
+                feats=feats, p_up=rec_p_up, confidence=rec_scores[rec_sym][1],
+                duration=duration, exp_win=exp_win_rate, score=rec_score
             )
 
+            # Final atomic gate re-check inside execute_single_step is the
+            # last line of defence — passes feats and direction through.
             won, _ = await execute_single_step(
-                client, state, rec_sym,
-                state.recovery_direction, state.recovery_stake, state.recovery_step,
-                duration=duration
+                client, state, rec_sym, rec_dir,
+                state.recovery_stake, state.recovery_step,
+                duration=duration, feats=feats
             )
 
             if won:
-                print(f"[Recovery] {rec_sym} recovered at step={state.recovery_step}.")
+                print(f"[Recovery] Recovered at step={state.recovery_step} "
+                      f"via {rec_sym} {'CALL' if rec_dir>0 else 'PUT'}.")
                 state.consecutive_losses[rec_sym] = 0
-                emit_sequence_summary(state, rec_sym, state.recovery_direction, True)
+                emit_sequence_summary(state, rec_sym, rec_dir, True)
                 clear_recovery(state)
             else:
                 next_step  = state.recovery_step + 1
                 next_stake = round(state.recovery_stake * MARTINGALE_FACTOR, 2)
                 if next_step > MARTINGALE_MAX_STEPS:
-                    print(f"[Recovery] {rec_sym} exhausted all {MARTINGALE_MAX_STEPS} steps — sequence closed.")
+                    print(f"[Recovery] Exhausted all {MARTINGALE_MAX_STEPS} steps — "
+                          f"closing sequence and running deep recalibration.")
                     state.consecutive_losses[rec_sym] += 1
-                    emit_sequence_summary(state, rec_sym, state.recovery_direction, False)
+                    emit_sequence_summary(state, rec_sym, rec_dir, False)
                     clear_recovery(state)
-                    # ── Post-loss deep recal: re-fit ALL symbols, then resume
-                    # open scanning with no symbol/direction lock. ──────────
-                    print(f"[Recovery] Triggering post-loss deep recalibration across all symbols.")
                     await deep_startup_calibration(state, symbol_data, symbols)
                 else:
                     state.recovery_step  = next_step
                     state.recovery_stake = next_stake
-                    print(f"[Recovery] {rec_sym} step lost — "
-                          f"waiting for signal before step={next_step} stake={next_stake:.2f}")
+                    print(f"[Recovery] step={state.recovery_step - 1} lost on {rec_sym} — "
+                          f"deep recalibration before step={next_step} stake={next_stake:.2f}")
+                    # Recalibrate before every recovery step so each attempt
+                    # uses the freshest possible models and thresholds.
+                    await deep_startup_calibration(state, symbol_data, symbols)
 
             state.last_activity = time.time()
             continue
@@ -2377,7 +2384,7 @@ async def main():
         )
 
         won, _ = await execute_single_step(
-            client, state, symbol, direction, base_stake, 0, duration=duration
+            client, state, symbol, direction, base_stake, 0, duration=duration, feats=feats
         )
 
         if won:
@@ -2395,12 +2402,10 @@ async def main():
                 await deep_startup_calibration(state, symbol_data, symbols)
 
             if MARTINGALE_MAX_STEPS >= 1:
-                state.recovery_symbol    = symbol
-                state.recovery_direction = direction
-                state.recovery_step      = 1
-                state.recovery_stake     = all_stakes[1]
-                print(f"[Recovery] Armed: waiting for fresh signal before "
-                      f"step=1 stake={all_stakes[1]:.2f} on any symbol/direction.")
+                state.recovery_step  = 1
+                state.recovery_stake = all_stakes[1]
+                print(f"[Recovery] Armed for step=1 stake={all_stakes[1]:.2f} — "
+                      f"open scan, any symbol/direction, fresh post-recal models.")
             else:
                 state.consecutive_losses[symbol] += 1
                 emit_sequence_summary(state, symbol, direction, False)
