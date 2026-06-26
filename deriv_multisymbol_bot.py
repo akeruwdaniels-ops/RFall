@@ -107,8 +107,8 @@ MIN_SCORE_GAP = 0.05
 # 12/16 layers must agree (75% supermajority). No more than 3 allowed to
 # actively oppose. This eliminates all the 9-agree / 5-disagree borderline
 # entries that the logs showed were the source of losses.
-MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (75% of 16)
-MAX_LAYER_DISAGREE = 3                 # maximum layers allowed to vote AGAINST
+MIN_LAYER_AGREE    = 11                # minimum layers voting FOR direction (75% of 16)
+MAX_LAYER_DISAGREE = 1                 # maximum layers allowed to vote AGAINST
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
 # Raised from 0.45 → 0.52: the best simulated duration must show a meaningful
@@ -124,8 +124,8 @@ ADAPTIVE_THRESHOLD_PERCENTILE = 75
 # After ANY loss, trigger a full deep recalibration across all symbols before
 # the next entry. No rate limiter — every loss gets a fresh recal.
 POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled recal only)
-CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks — Deriv only accepts 1-10 tick contracts
-MC_SIMULATIONS = 901
+CANDIDATE_DURATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # ticks — Deriv only accepts 1-10 tick contracts
+MC_SIMULATIONS = 50000
 
 WATCHDOG_TIMEOUT = 5 * 60              # seconds of total silence (no tick, no loop iteration)
                                         # before the bot force-restarts itself in place
