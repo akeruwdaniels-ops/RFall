@@ -4,4 +4,4 @@ numpy>=2.0
 scipy>=1.17
 statsmodels>=0.14
 arch>=8.0
-hmmlearn>=0.3
+hmmlearn>=0.3.2
