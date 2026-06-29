@@ -107,6 +107,16 @@ BARRIER_SIGMAS = [0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
                   0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.50, 1.75, 2.00]
 BARRIER_ABS_MIN = 0.3    # minimum absolute barrier (price units)
 
+# ── Asymmetric barrier config ─────────────────────────────────────────────
+# Bias signal: measured over this many ticks of recent price history
+BIAS_LOOKBACK      = 60      # ticks to measure directional drift
+BIAS_MAX           = 0.35    # cap bias magnitude (prevents degenerate barriers)
+# Grid of asymmetry ratios for (upper, lower) sides swept around symmetric base.
+# Ratio > 1.0 = that side is wider than the symmetric baseline.
+ASYM_RATIO_GRID    = [0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30]
+# Neither side can be less than this fraction of the symmetric barrier_abs
+ASYM_SIDE_MIN_FRAC = 0.50
+
 # ── Per-symbol gate thresholds ────────────────────────────────────────────
 SYMBOL_CONFIG = {
     "1HZ10V": {
@@ -606,17 +616,55 @@ def structural_gate(symbol: str, prices: np.ndarray, price_diffs: np.ndarray,
 
 
 # =============================================================================
-# MC ENGINE  — BUG 1 fixed: uses absolute vol correctly
+# DIRECTIONAL BIAS SIGNAL
 # =============================================================================
-def mc_breach_estimate(abs_vol_per_tick: float, barrier_abs: float,
-                       duration_secs: float, ticks_per_sec: float) -> dict:
+def compute_directional_bias(prices: np.ndarray, abs_vol_per_tick: float) -> float:
     """
-    Estimates Pr(|X_terminal| < barrier_abs) via batched MC.
-    Terminal distribution: X_T ~ N(0, abs_vol_per_tick * sqrt(n_steps))
-    where abs_vol_per_tick is in ABSOLUTE PRICE UNITS.
+    Returns a bias in [-1, +1].
+      +1 = strong upward drift  → widen upper barrier, tighten lower
+      -1 = strong downward drift → widen lower barrier, tighten upper
+       0 = no detectable drift  → symmetric barriers
+
+    Method: net displacement over BIAS_LOOKBACK ticks, normalised by the
+    expected random-walk displacement (vol * sqrt(n)).  Capped at BIAS_MAX
+    so extreme readings don't produce degenerate barriers.
+    """
+    n = min(BIAS_LOOKBACK, len(prices))
+    if n < 10 or abs_vol_per_tick < 1e-9:
+        return 0.0
+
+    window        = prices[-n:]
+    net_move      = float(window[-1] - window[0])
+    expected_move = abs_vol_per_tick * math.sqrt(n)   # 1-sigma expected range
+
+    raw_bias = net_move / max(expected_move, 1e-9)
+    return float(np.clip(raw_bias, -BIAS_MAX / 0.01, BIAS_MAX / 0.01) * 0.01)
+
+
+# =============================================================================
+# MC ENGINE  — asymmetric: samples terminal displacement with drift mean-shift
+# =============================================================================
+def mc_asymmetric_estimate(abs_vol_per_tick: float,
+                           upper_abs: float, lower_abs: float,
+                           duration_secs: float, ticks_per_sec: float,
+                           drift_per_tick: float = 0.0) -> dict:
+    """
+    Estimates Pr(lower_abs < X_terminal < upper_abs) via batched MC.
+
+    X_terminal ~ N(drift_per_tick * n_steps, (abs_vol_per_tick * sqrt(n_steps))^2)
+
+    upper_abs  : distance from entry spot to upper barrier  (positive)
+    lower_abs  : distance from entry spot to lower barrier  (positive)
+    drift_per_tick : expected price change per tick in absolute units
+                     (positive = upward, negative = downward).
+                     Derived from directional bias signal.
+
+    EXPIRYRANGE settles on terminal price only (no path check), so sampling
+    just the terminal value is both correct and efficient.
     """
     n_steps      = max(1, int(round(duration_secs * ticks_per_sec)))
     vol_terminal = abs_vol_per_tick * math.sqrt(n_steps)
+    drift_total  = drift_per_tick * n_steps    # total expected drift over contract
 
     if vol_terminal < 1e-9:
         return {"blocked": True, "reason": f"vol_terminal={vol_terminal:.2e} too small"}
@@ -625,8 +673,10 @@ def mc_breach_estimate(abs_vol_per_tick: float, barrier_abs: float,
     done = 0
     while done < MC_SIMULATIONS:
         batch    = min(MC_BATCH_SIZE, MC_SIMULATIONS - done)
-        terminal = np.random.normal(0.0, vol_terminal, size=batch)
-        wins    += int(np.sum(np.abs(terminal) < barrier_abs))
+        # Terminal displacement = drift + diffusion noise
+        terminal = np.random.normal(drift_total, vol_terminal, size=batch)
+        # Win condition: displacement lands strictly inside asymmetric window
+        wins    += int(np.sum((terminal > -lower_abs) & (terminal < upper_abs)))
         done    += batch
 
     win_prob = wins / MC_SIMULATIONS
@@ -635,8 +685,12 @@ def mc_breach_estimate(abs_vol_per_tick: float, barrier_abs: float,
         "win_prob":     win_prob,
         "breach_prob":  1.0 - win_prob,
         "vol_terminal": vol_terminal,
+        "drift_total":  drift_total,
         "n_steps":      n_steps,
         "n_sims":       MC_SIMULATIONS,
+        "upper_abs":    upper_abs,
+        "lower_abs":    lower_abs,
+        "symmetric":    abs(upper_abs - lower_abs) < 1e-6,
     }
 
 
@@ -646,15 +700,29 @@ def ci_lower_bound(win_prob: float, n: int) -> float:
 
 
 # =============================================================================
-# MC AUTO-OPTIMIZER
+# MC AUTO-OPTIMIZER  — asymmetric barrier sweep
 # =============================================================================
 def mc_auto_optimize(prices: np.ndarray, price_diffs: np.ndarray,
                      returns: np.ndarray, symbol: str,
                      garch_result, state: BotState) -> Optional[List[dict]]:
     """
-    Sweeps (duration × barrier_sigma) grid.
-    Returns list of passing candidates sorted by win_prob ascending
-    (lowest win = narrowest barrier = highest Deriv payout) or None.
+    Sweeps (duration × barrier_sigma × asym_ratio) grid.
+
+    For each symmetric baseline barrier_abs, the asymmetry ratio splits it:
+      upper_abs = barrier_abs * upper_ratio
+      lower_abs = barrier_abs * lower_ratio
+
+    The ratio pair is chosen from ASYM_RATIO_GRID for both sides independently,
+    but biased by the directional signal:
+      bias > 0 (up drift) → favour upper_ratio > 1, lower_ratio < 1
+      bias < 0 (down drift) → favour lower_ratio > 1, upper_ratio < 1
+      bias ≈ 0             → symmetric (1.0, 1.0) gets the most weight
+
+    The drift is injected into the MC terminal distribution as a mean shift,
+    so win_prob correctly reflects both the asymmetric window AND the drift.
+
+    Returns candidates sorted by win_prob ascending (lowest win = narrowest
+    barrier = highest Deriv payout), or None if no candidate passes.
     """
     cfg           = SYMBOL_CONFIG[symbol]
     ticks_per_sec = cfg["ticks_per_sec"]
@@ -664,7 +732,38 @@ def mc_auto_optimize(prices: np.ndarray, price_diffs: np.ndarray,
         prices, returns, garch_result, price_now)
     abs_vol *= state.vol_scalar.get(symbol, 1.0)
 
+    # ── Directional bias & drift ──────────────────────────────────────────
+    bias         = compute_directional_bias(prices, abs_vol)   # [-1, +1] capped
+    # Convert bias to a per-tick drift in absolute price units.
+    # bias=±BIAS_MAX → drift = ±BIAS_MAX * abs_vol (i.e. up to BIAS_MAX sigma/tick)
+    drift_per_tick = bias * abs_vol
+
+    bias_str = (f"UP  {bias:+.3f}" if bias >  0.02 else
+                f"DN  {bias:+.3f}" if bias < -0.02 else
+                f"FLAT {bias:+.3f}")
+    print(f"[MC] {symbol}  bias={bias_str}  drift/tick={drift_per_tick:+.5f}  "
+          f"abs_vol={abs_vol:.5f}  ({'GARCH' if used_garch else 'baseline'})")
+
+    # ── Build asymmetry pairs biased toward drift direction ───────────────
+    # For each candidate (upper_ratio, lower_ratio):
+    #   if bias > 0: upper_ratio ≥ lower_ratio preferred (widen upside)
+    #   if bias < 0: lower_ratio ≥ upper_ratio preferred (widen downside)
+    # We generate all pairs from ASYM_RATIO_GRID and score them by alignment.
+    def bias_score(ur: float, lr: float) -> float:
+        """Higher = better aligned with current bias direction."""
+        asym = (ur - lr)      # +ve = upper wider, -ve = lower wider
+        return asym * bias    # maximised when asym aligns with bias sign
+
+    asym_pairs = []
+    for ur in ASYM_RATIO_GRID:
+        for lr in ASYM_RATIO_GRID:
+            asym_pairs.append((ur, lr, bias_score(ur, lr)))
+    # Sort by alignment descending so aligned pairs are tried first
+    asym_pairs.sort(key=lambda x: -x[2])
+
     candidates = []
+    seen_keys  = set()   # deduplicate (dur, upper_abs_rounded, lower_abs_rounded)
+
     for dur_secs in DURATION_CANDIDATES:
         n_steps      = max(1, int(round(dur_secs * ticks_per_sec)))
         vol_terminal = abs_vol * math.sqrt(n_steps)
@@ -672,39 +771,69 @@ def mc_auto_optimize(prices: np.ndarray, price_diffs: np.ndarray,
         for bs in BARRIER_SIGMAS:
             barrier_abs = max(bs * vol_terminal, BARRIER_ABS_MIN)
 
-            mc = mc_breach_estimate(abs_vol, barrier_abs, dur_secs, ticks_per_sec)
-            if mc.get("blocked"):
-                continue
+            for ur, lr, _ in asym_pairs:
+                upper_abs = barrier_abs * ur
+                lower_abs = barrier_abs * lr
 
-            wp  = mc["win_prob"]
-            cil = ci_lower_bound(wp, MC_SIMULATIONS)
+                # Enforce minimum side size
+                min_side = barrier_abs * ASYM_SIDE_MIN_FRAC
+                if upper_abs < min_side or lower_abs < min_side:
+                    continue
 
-            if wp  < MC_REQUIRED_WIN: continue
-            if cil < MC_REQUIRED_CI:  continue
+                # Deduplicate to avoid running near-identical MC calls
+                key = (dur_secs, round(upper_abs, 3), round(lower_abs, 3))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
 
-            # Learned preference weights
-            dw  = state.duration_weights.get(symbol, {}).get(dur_secs, 1.0)
-            bw  = state.barrier_weights.get(symbol, {}).get(round(bs * 2) / 2, 1.0)
+                mc = mc_asymmetric_estimate(
+                    abs_vol, upper_abs, lower_abs,
+                    dur_secs, ticks_per_sec,
+                    drift_per_tick=drift_per_tick)
+                if mc.get("blocked"):
+                    continue
 
-            candidates.append({
-                "duration_secs":  dur_secs,
-                "barrier_abs":    barrier_abs,
-                "barrier_sigma":  bs,
-                "n_steps":        n_steps,
-                "win_prob":       wp,
-                "ci_lower":       cil,
-                "breach_prob":    mc["breach_prob"],
-                "vol_per_tick":   abs_vol,
-                "vol_terminal":   vol_terminal,
-                "used_garch":     used_garch,
-                "vol_trust":      vol_trust,
-                "weighted_score": wp * dw * bw,
-            })
+                wp  = mc["win_prob"]
+                cil = ci_lower_bound(wp, MC_SIMULATIONS)
+
+                if wp  < MC_REQUIRED_WIN: continue
+                if cil < MC_REQUIRED_CI:  continue
+
+                # Learned preference weights (keyed on symmetric baseline sigma)
+                dw = state.duration_weights.get(symbol, {}).get(dur_secs, 1.0)
+                bw = state.barrier_weights.get(symbol, {}).get(round(bs * 2) / 2, 1.0)
+
+                # Asymmetry alignment bonus: reward candidates whose upper/lower
+                # split is well-aligned with the bias signal.
+                asym_alignment = 1.0 + 0.15 * abs(bias) * bias_score(ur, lr)
+
+                candidates.append({
+                    "duration_secs":   dur_secs,
+                    "barrier_abs":     barrier_abs,      # symmetric baseline (for logging/Bayes)
+                    "upper_abs":       upper_abs,        # actual upper distance from spot
+                    "lower_abs":       lower_abs,        # actual lower distance from spot
+                    "upper_ratio":     ur,
+                    "lower_ratio":     lr,
+                    "barrier_sigma":   bs,
+                    "n_steps":         n_steps,
+                    "win_prob":        wp,
+                    "ci_lower":        cil,
+                    "breach_prob":     mc["breach_prob"],
+                    "vol_per_tick":    abs_vol,
+                    "vol_terminal":    vol_terminal,
+                    "used_garch":      used_garch,
+                    "vol_trust":       vol_trust,
+                    "drift_per_tick":  drift_per_tick,
+                    "bias":            bias,
+                    "drift_total":     mc["drift_total"],
+                    "weighted_score":  wp * dw * bw * asym_alignment,
+                    "symmetric":       mc["symmetric"],
+                })
 
     if not candidates:
         return None
 
-    # Sort ascending by win_prob: lowest win = narrowest barrier = highest payout
+    # Sort ascending by win_prob: lowest win = narrowest effective window = highest payout
     candidates.sort(key=lambda x: x["win_prob"])
     return candidates
 
@@ -770,10 +899,11 @@ async def execute_expiryrange(client: DerivClient, state: BotState,
     """
     price_now     = state.last_price[symbol]
     duration_secs = int(candidate["duration_secs"])
-    barrier_abs   = candidate["barrier_abs"]
     bdp           = SYMBOL_CONFIG[symbol].get("barrier_dp", 5)
-    upper         = round(price_now + barrier_abs, bdp)
-    lower         = round(price_now - barrier_abs, bdp)
+    upper_abs     = candidate["upper_abs"]
+    lower_abs     = candidate["lower_abs"]
+    upper         = round(price_now + upper_abs, bdp)
+    lower         = round(price_now - lower_abs, bdp)
 
     # Stage 3: Proposal API payout verification
     net_payout, ask_price = await fetch_proposal_payout(
@@ -789,12 +919,23 @@ async def execute_expiryrange(client: DerivClient, state: BotState,
         return False, 0.0, False
 
     SEP = "-" * 68
+    sym_tag = "SYMMETRIC" if candidate.get("symmetric") else \
+              f"ASYM  u={candidate['upper_ratio']:.2f}x / l={candidate['lower_ratio']:.2f}x"
+    bias_val = candidate.get("bias", 0.0)
+    bias_tag = (f"UP {bias_val:+.3f}" if bias_val >  0.02 else
+                f"DN {bias_val:+.3f}" if bias_val < -0.02 else
+                f"FLAT {bias_val:+.3f}")
     print(f"\n{SEP}")
     print(f"  EXPIRYRANGE  {symbol}  {datetime.now(timezone.utc).isoformat()}")
     print(SEP)
     print(f"  Entry         : {price_now:.5f}")
-    print(f"  Barriers      : [{lower:.5f}, {upper:.5f}]  "
-          f"(+/-{barrier_abs:.5f} = {candidate['barrier_sigma']:.2f}s_terminal)")
+    print(f"  Upper barrier : {upper:.5f}  (+{upper_abs:.5f} from spot)")
+    print(f"  Lower barrier : {lower:.5f}  (-{lower_abs:.5f} from spot)")
+    print(f"  Asym profile  : {sym_tag}  |  bias={bias_tag}")
+    print(f"  Drift/tick    : {candidate.get('drift_per_tick', 0.0):+.5f}  "
+          f"total over {candidate['n_steps']} ticks={candidate.get('drift_total', 0.0):+.5f}")
+    print(f"  Sigma base    : {candidate['barrier_sigma']:.2f}x terminal_vol "
+          f"({candidate['vol_terminal']:.5f})")
     print(f"  Duration      : {duration_secs}s  ({candidate['n_steps']} ticks)")
     print(f"  Stake/Ask     : ${BASE_STAKE:.2f} / ${ask_price:.4f}")
     print(f"  Net payout    : ${net_payout:.4f}  (confirmed by Deriv proposal API)")
@@ -890,7 +1031,13 @@ async def execute_expiryrange(client: DerivClient, state: BotState,
         "entry_price":   price_now,
         "upper_barrier": upper,
         "lower_barrier": lower,
-        "barrier_width": barrier_abs * 2,
+        "barrier_width": upper_abs + lower_abs,   # total window width
+        "upper_abs":     upper_abs,
+        "lower_abs":     lower_abs,
+        "upper_ratio":   candidate.get("upper_ratio", 1.0),
+        "lower_ratio":   candidate.get("lower_ratio", 1.0),
+        "bias":          candidate.get("bias", 0.0),
+        "drift_per_tick": candidate.get("drift_per_tick", 0.0),
         "duration_secs": duration_secs,
         "won":           won,
         "profit":        profit,
