@@ -117,6 +117,7 @@ SYMBOL_CONFIG = {
         "boll_width_factor": 1.20,
         "max_hawkes":        0.50,
         "cooldown_secs":     150,
+        "barrier_dp":        2,    # Deriv: max 2 decimal places for 1HZ10V barriers
     },
     "RDBEAR": {
         "ticks_per_sec":     1.0,
@@ -126,6 +127,7 @@ SYMBOL_CONFIG = {
         "boll_width_factor": 1.15,
         "max_hawkes":        0.40,
         "cooldown_secs":     180,
+        "barrier_dp":        4,    # Deriv: max 4 decimal places for RDBEAR barriers
     },
 }
 
@@ -720,12 +722,13 @@ async def fetch_proposal_payout(client: DerivClient, symbol: str,
     Returns (None, BASE_STAKE) on any failure.
     """
     try:
+        bdp = SYMBOL_CONFIG[symbol].get("barrier_dp", 5)
         resp = await client.send({
             "proposal": 1, "amount": BASE_STAKE, "basis": "stake",
             "contract_type": "EXPIRYRANGE", "currency": "USD",
             "duration": duration_secs, "duration_unit": "s",
             "underlying_symbol": symbol,
-            "barrier": str(round(upper, 5)), "barrier2": str(round(lower, 5)),
+            "barrier": str(round(upper, bdp)), "barrier2": str(round(lower, bdp)),
         }, timeout=12)
 
         if "error" in resp:
@@ -768,8 +771,9 @@ async def execute_expiryrange(client: DerivClient, state: BotState,
     price_now     = state.last_price[symbol]
     duration_secs = int(candidate["duration_secs"])
     barrier_abs   = candidate["barrier_abs"]
-    upper         = round(price_now + barrier_abs, 5)
-    lower         = round(price_now - barrier_abs, 5)
+    bdp           = SYMBOL_CONFIG[symbol].get("barrier_dp", 5)
+    upper         = round(price_now + barrier_abs, bdp)
+    lower         = round(price_now - barrier_abs, bdp)
 
     # Stage 3: Proposal API payout verification
     net_payout, ask_price = await fetch_proposal_payout(
@@ -817,8 +821,8 @@ async def execute_expiryrange(client: DerivClient, state: BotState,
                 "duration":          duration_secs,
                 "duration_unit":     "s",
                 "underlying_symbol": symbol,
-                "barrier":           str(upper),
-                "barrier2":          str(lower),
+                "barrier":           str(round(upper, bdp)),
+                "barrier2":          str(round(lower, bdp)),
             },
         }, timeout=30)
 
